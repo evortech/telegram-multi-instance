@@ -27,7 +27,7 @@ Telegram Desktop allows only one running copy per data folder. Two official flag
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/telegram-multi-instance.git
+git clone https://github.com/evortech/telegram-multi-instance.git
 cd telegram-multi-instance
 ./install.sh
 ```
