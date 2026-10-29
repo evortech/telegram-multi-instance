@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# tgm - run many Telegram Desktop instances on Linux (one isolated profile each)
+set -u
+
+VERSION="1.0.0"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/tgm.conf"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+TG_DATA="${TG_DATA:-$HOME/telegram-instances}"   # where profiles live
+TG_COUNT="${TG_COUNT:-10}"                       # what "all" means
+TG_MAX_RUNNING="${TG_MAX_RUNNING:-10}"           # safety limit
+TG_DELAY="${TG_DELAY:-2}"                        # seconds between launches
+TG_BIN="${TG_BIN:-}"                             # path to Telegram binary (auto-detected)
+
+die() { echo "error: $*" >&2; exit 1; }
+
+find_bin() {
+  local c
+  [ -n "$TG_BIN" ] && [ -x "$TG_BIN" ] && { echo "$TG_BIN"; return 0; }
+  for c in "$HOME/.local/opt/Telegram/Telegram" /opt/Telegram/Telegram "$(command -v Telegram 2>/dev/null)"; do
+    [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# Expand "1 3 5", "2-5", "all" into a list of numbers
+expand() {
+  local out=() a
+  for a in "$@"; do
+    if [ "$a" = "all" ]; then
+      mapfile -t -O "${#out[@]}" out < <(seq 1 "$TG_COUNT")
+    elif [[ $a =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      mapfile -t -O "${#out[@]}" out < <(seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
+    elif [[ $a =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ]; then
+      out+=("$a")
+    else
+      die "bad instance '$a' (use: 3 | 1 2 3 | 2-5 | all)"
+    fi
+  done
+  echo "${out[@]}"
+}
+
+pat()        { printf -- '-many -workdir %s/tg%s$' "$TG_DATA" "$1"; }
+is_running() { pgrep -f -- "$(pat "$1")" >/dev/null 2>&1; }
+running_count() { local c; c=$(pgrep -fc -- "-many -workdir $TG_DATA/tg[0-9]+\$" 2>/dev/null); echo "${c:-0}"; }
+
+cmd_start() {
+  [ $# -ge 1 ] || die "usage: tgm start <n...|a-b|all>"
+  local bin n ids
+  bin=$(find_bin) || die "Telegram not found. Run ./install.sh first (or set TG_BIN)."
+  ids=$(expand "$@") || exit 1
+  for n in $ids; do
+    if is_running "$n"; then echo "tg$n  already running"; continue; fi
+    if [ "$(running_count)" -ge "$TG_MAX_RUNNING" ]; then
+      echo "limit reached ($TG_MAX_RUNNING running). Raise TG_MAX_RUNNING to allow more." >&2; break
+    fi
+    mkdir -p "$TG_DATA/tg$n"
+    setsid nohup "$bin" -many -workdir "$TG_DATA/tg$n" >/dev/null 2>&1 &
+    echo "tg$n  started"
+    sleep "$TG_DELAY"
+  done
+}
+
+cmd_stop() {
+  local n ids
+  if [ $# -eq 0 ] || [ "$1" = "all" ]; then
+    pkill -f -- "-many -workdir $TG_DATA/tg[0-9]+\$" && echo "all instances stopped" || echo "nothing running"
+    return
+  fi
+  ids=$(expand "$@") || exit 1
+  for n in $ids; do
+    if pkill -f -- "$(pat "$n")"; then echo "tg$n  stopped"; else echo "tg$n  not running"; fi
+  done
+}
+
+cmd_restart() { cmd_stop "$@"; sleep 2; [ $# -eq 0 ] && set -- all; cmd_start "$@"; }
+
+cmd_list() {
+  [ -d "$TG_DATA" ] || { echo "no instances yet ($TG_DATA)"; return; }
+  printf '%-8s %-9s %s\n' INSTANCE STATE SIZE
+  local d n
+  for d in "$TG_DATA"/tg[0-9]*; do
+    [ -d "$d" ] || continue
+    n=${d##*/tg}
+    printf '%-8s %-9s %s\n' "tg$n" "$(is_running "$n" && echo running || echo stopped)" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+  done | sort -V
+}
+
+cmd_status() {
+  local total=0 n pid rss
+  echo "running: $(running_count) / $TG_MAX_RUNNING"
+  for n in $(seq 1 "$TG_COUNT"); do
+    for pid in $(pgrep -f -- "$(pat "$n")" 2>/dev/null); do
+      rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' '); rss=${rss:-0}
+      printf 'tg%-3s pid %-7s %5d MB\n' "$n" "$pid" $((rss/1024)); total=$((total+rss))
+    done
+  done
+  echo "total Telegram RAM: $((total/1024)) MB"
+  awk '/MemAvailable/{printf "system RAM available: %d MB\n",$2/1024}' /proc/meminfo
+}
+
+cmd_shortcut() {
+  [ $# -ge 1 ] || die "usage: tgm shortcut <n...|all>"
+  local bin n ids dir="$HOME/.local/share/applications"
+  bin=$(find_bin) || die "Telegram not found."
+  mkdir -p "$dir"; ids=$(expand "$@") || exit 1
+  for n in $ids; do
+    cat > "$dir/telegram-instance-$n.desktop" <<DESK
+[Desktop Entry]
+Type=Application
+Name=Telegram $n
+Exec="$bin" -many -workdir "$TG_DATA/tg$n"
+Icon=telegram
+Categories=Network;InstantMessaging;
+Terminal=false
+DESK
+    echo "created launcher: Telegram $n"
+  done
+}
+
+cmd_remove() {
+  [ $# -ge 1 ] || die "usage: tgm remove <n>"
+  local n; [[ $1 =~ ^[0-9]+$ ]] || die "give one instance number"; n=$1
+  is_running "$n" && die "tg$n is running; stop it first"
+  [ -d "$TG_DATA/tg$n" ] || die "tg$n does not exist"
+  read -r -p "Delete tg$n and its login/session permanently? [y/N] " a
+  [ "$a" = y ] && rm -rf "${TG_DATA:?}/tg$n" && echo "tg$n deleted" || echo "cancelled"
+}
+
+usage() { cat <<U
+tgm $VERSION - many Telegram Desktop instances, one isolated profile each
+
+usage: tgm <command> [instances]
+
+  start <n...|a-b|all>   start instances      tgm start 1 2 3 | tgm start 1-5
+  stop  [n...|all]       stop instances       (no argument = stop everything)
+  restart [n...|all]     stop then start
+  list                   show all instances and their state
+  status                 RAM used per instance and free system RAM
+  shortcut <n...|all>    add "Telegram N" entries to the app menu
+  remove <n>             delete one instance and its data (asks first)
+
+settings (env vars or ~/.config/tgm.conf):
+  TG_DATA=$TG_DATA  TG_COUNT=$TG_COUNT  TG_MAX_RUNNING=$TG_MAX_RUNNING  TG_DELAY=$TG_DELAY
+U
+}
+
+c="${1:-}"; [ $# -gt 0 ] && shift
+case "$c" in
+  start) cmd_start "$@";;   stop) cmd_stop "$@";;     restart) cmd_restart "$@";;
+  list|ls) cmd_list;;       status) cmd_status;;      shortcut) cmd_shortcut "$@";;
+  remove|rm) cmd_remove "$@";;  -v|--version) echo "tgm $VERSION";;
+  *) usage;;
+esac
